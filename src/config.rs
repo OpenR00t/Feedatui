@@ -37,6 +37,9 @@ images = true
 # above the text instead).
 lead_image_width = 40
 
+# Glide over half-page, page and top/bottom jumps instead of snapping.
+smooth_scroll = true
+
 # Tallest an image may be, in percent of the article pane's height.
 image_max_height = 40
 
@@ -136,6 +139,8 @@ pub struct Config {
     pub image_max_height: u16,
     #[serde(default)]
     pub full_article: FullMode,
+    #[serde(default = "default_true")]
+    pub smooth_scroll: bool,
     #[serde(default)]
     pub browser: Option<String>,
     #[serde(default, rename = "group")]

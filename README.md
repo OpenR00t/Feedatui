@@ -46,6 +46,7 @@ full_article = "auto"   # "auto", "always" or "never"
 images = true           # false: no graphics probe, no image downloads
 lead_image_width = 40   # % of the pane for the top-left picture (0: above the text)
 image_max_height = 40   # tallest image, % of the pane height
+smooth_scroll = true    # glide over page jumps instead of snapping
 cache_limit_mb = 200    # image cache size
 # browser = "firefox"   # program for links; default is the system browser
 
@@ -102,7 +103,9 @@ are fetched in the background, so moving down the list rarely waits.
 | `q` | quit |
 
 The mouse wheel scrolls whichever pane it is over; clicking a title selects
-it.
+it. Half-page, page, top/bottom and mouse-wheel jumps in the article glide
+over a few frames (about a tenth of a second) rather than snapping; single
+lines move at once. `smooth_scroll = false` turns the glide off.
 
 An article is marked read when you move onto it, open its pane or open its
 link. Refreshing or switching groups never marks anything read.

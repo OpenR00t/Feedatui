@@ -141,7 +141,10 @@ fn run() -> Result<()> {
                 dirty = false;
                 last_draw = Instant::now();
             }
-            if event::poll(Duration::from_millis(25))? {
+            let animating = app.animate();
+            dirty |= animating;
+            let wait = if animating { 8 } else { 25 };
+            if event::poll(Duration::from_millis(wait))? {
                 // Handle everything queued so a held key doesn't lag.
                 loop {
                     match event::read()? {

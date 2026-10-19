@@ -98,7 +98,11 @@ pub struct App {
     /// (feed url, index into that feed's stored items), newest first.
     pub visible: Vec<(String, usize)>,
     pub list: ListState,
+    /// The row drawn at the top of the article pane.
     pub scroll: usize,
+    /// Where scrolling is heading; `scroll` eases toward it.
+    pub scroll_target: usize,
+    last_frame: Instant,
     /// Rows the current article takes, set while drawing.
     pub article_rows: usize,
     /// The article on screen, keyed by item id and which text it shows.
@@ -174,6 +178,8 @@ impl App {
             visible: Vec::new(),
             list: ListState::default(),
             scroll: 0,
+            scroll_target: 0,
+            last_frame: Instant::now(),
             article_rows: 0,
             doc_cache: None,
             full,
@@ -368,7 +374,7 @@ impl App {
         // A rebuild (refresh, group switch, filter) never marks anything read;
         // only moving onto an article or opening it does.
         if self.selected_item().map(|i| i.id.clone()) != before {
-            self.scroll = 0;
+            self.jump_to(0);
         }
     }
 
@@ -390,7 +396,7 @@ impl App {
 
     fn on_selection_changed(&mut self) {
         self.motion();
-        self.scroll = 0;
+        self.jump_to(0);
         self.mark_selected_read();
         self.prefetch();
     }
@@ -581,7 +587,7 @@ impl App {
             self.full.retry(&item.id);
         }
         self.full_view.insert(item.id.clone(), show);
-        self.scroll = 0;
+        self.jump_to(0);
         self.mark_selected_read();
     }
 
@@ -618,8 +624,44 @@ impl App {
 
     fn scroll_by(&mut self, delta: isize) {
         self.motion();
-        let max = self.article_rows.saturating_sub(self.article_page());
-        self.scroll = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
+        let max = self.article_rows.saturating_sub(self.article_page()) as isize;
+        let target = (self.scroll_target as isize)
+            .saturating_add(delta)
+            .clamp(0, max) as usize;
+        self.scroll_target = target;
+        // Single lines move at once; bigger jumps glide when smooth scrolling is on.
+        if !self.cfg.smooth_scroll || self.scroll.abs_diff(target) <= 1 {
+            self.scroll = target;
+        }
+    }
+
+    /// Puts the article at `row` straight away (new article, reset).
+    fn jump_to(&mut self, row: usize) {
+        self.scroll = row;
+        self.scroll_target = row;
+    }
+
+    /// Moves `scroll` a step toward its target; true while still moving.
+    /// Steps shrink as it nears the target (ease-out), at most one per ~12 ms.
+    pub fn animate(&mut self) -> bool {
+        if self.scroll == self.scroll_target {
+            return false;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_frame) < Duration::from_millis(12) {
+            return true;
+        }
+        self.last_frame = now;
+        let diff = self.scroll.abs_diff(self.scroll_target);
+        let step = diff.div_ceil(3).max(1);
+        if self.scroll < self.scroll_target {
+            self.scroll += step;
+        } else {
+            self.scroll -= step;
+        }
+        // Frames during a glide are cheap ones: heavy images use stand-ins.
+        self.fast_until = Some(now + Duration::from_millis(180));
+        true
     }
 
     fn open_link(&mut self) {
@@ -966,7 +1008,7 @@ impl App {
     fn go_top(&mut self) {
         match self.focus {
             Focus::List => self.select(0),
-            Focus::Article => self.scroll = 0,
+            Focus::Article => self.scroll_by(-(self.scroll_target as isize)),
         }
     }
 

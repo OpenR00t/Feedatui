@@ -228,6 +228,7 @@ fn draw_article(f: &mut Frame, app: &mut App, area: Rect) {
     app.article_rows = y;
     let page = usize::from(content.height);
     app.scroll = app.scroll.min(y.saturating_sub(page));
+    app.scroll_target = app.scroll_target.min(y.saturating_sub(page));
     let scroll = app.scroll;
 
     let pct = if y <= page {
