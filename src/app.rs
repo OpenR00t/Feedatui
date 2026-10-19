@@ -11,21 +11,37 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use image::DynamicImage;
 use ratatui::layout::{Position, Rect, Size};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::ListState;
 use ratatui_image::sliced::SlicedProtocol;
 
-use crate::article::{self, Article};
-use crate::config::{Config, Paths};
+use crate::article::{self, Doc};
+use crate::config::{Config, FullMode, Paths};
 use crate::feed::{self, Fetched, Item};
+use crate::fulltext::{self, FullState, FullText};
 use crate::images::Images;
 use crate::store::Store;
+use crate::theme;
 
 const FEED_WORKERS: usize = 6;
 
 pub enum Event {
     FeedFetched(String, Result<Fetched, String>),
     ImageDecoded(String, Option<DynamicImage>),
-    ImageEncoded(String, Size, Option<SlicedProtocol>),
+    ImageEncoded(String, Size, bool, Option<SlicedProtocol>),
+    FullFetched(String, Result<fulltext::Fetched, String>),
+}
+
+/// Which text of an article is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    Feed,
+    /// Feed text while the full article loads.
+    Fetching,
+    /// Feed text because the full article could not be had.
+    FetchFailed,
+    Full,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +101,14 @@ pub struct App {
     pub scroll: usize,
     /// Rows the current article takes, set while drawing.
     pub article_rows: usize,
-    pub article_cache: Option<(String, u16, Article)>,
+    /// The article on screen, keyed by item id and which text it shows.
+    doc_cache: Option<(String, Variant, Doc)>,
+    pub full: FullText,
+    /// `f` toggles: item id → show the full article or not.
+    full_view: HashMap<String, bool>,
+    /// For telling a held key from single presses.
+    motion_at: Option<Instant>,
+    fast_until: Option<Instant>,
     pub filter: String,
     pub filtering: bool,
     pub unread_only: bool,
@@ -139,6 +162,7 @@ impl App {
                 }
             });
         }
+        let full = FullText::new(paths.article_cache.clone(), events.clone());
         let mut app = Self {
             cfg,
             paths,
@@ -151,7 +175,11 @@ impl App {
             list: ListState::default(),
             scroll: 0,
             article_rows: 0,
-            article_cache: None,
+            doc_cache: None,
+            full,
+            full_view: HashMap::new(),
+            motion_at: None,
+            fast_until: None,
             filter: String::new(),
             filtering: false,
             unread_only: false,
@@ -361,8 +389,10 @@ impl App {
     }
 
     fn on_selection_changed(&mut self) {
+        self.motion();
         self.scroll = 0;
         self.mark_selected_read();
+        self.prefetch();
     }
 
     fn mark_selected_read(&mut self) {
@@ -387,23 +417,199 @@ impl App {
 
     // ----- article ------------------------------------------------------
 
-    /// The laid-out current article for `width`, rebuilt when needed.
-    pub fn article(&mut self, width: u16) -> Option<&Article> {
-        let item = self.selected_item()?.clone();
-        let fresh = self
-            .article_cache
-            .as_ref()
-            .is_some_and(|(id, w, _)| *id == item.id && *w == width);
-        if !fresh {
-            let source = self.feed_name(&item.feed_url);
-            let art = article::build(&item, &source, width);
-            if let Some(images) = &mut self.images {
-                images.retain(&art.images);
-                images.request(&art.images);
-            }
-            self.article_cache = Some((item.id.clone(), width, art));
+    /// Whether an article should show its full, fetched version.
+    pub fn wants_full(&self, item: &Item) -> bool {
+        if item.link.is_none() {
+            return false;
         }
-        self.article_cache.as_ref().map(|(_, _, a)| a)
+        if let Some(v) = self.full_view.get(&item.id) {
+            return *v;
+        }
+        match self.cfg.full_mode(&item.feed_url) {
+            FullMode::Always => true,
+            FullMode::Never => false,
+            FullMode::Auto => crate::html::looks_truncated(&item.body),
+        }
+    }
+
+    fn variant(&self, item: &Item) -> Variant {
+        if !self.wants_full(item) {
+            return Variant::Feed;
+        }
+        match self.full.state(&item.id) {
+            Some(FullState::Ready(_)) => Variant::Full,
+            Some(FullState::Failed(_)) => Variant::FetchFailed,
+            _ => Variant::Fetching,
+        }
+    }
+
+    fn build_doc(&self, item: &Item, variant: Variant) -> Doc {
+        let source = self.feed_name(&item.feed_url);
+        let full = match self.full.state(&item.id) {
+            Some(FullState::Ready(f)) if variant == Variant::Full => Some(Arc::clone(f)),
+            _ => None,
+        };
+        let mut doc = match &full {
+            Some(f) => article::build(item, &source, &f.html, Some(&f.url)),
+            None => article::build(item, &source, &item.body, None),
+        };
+        let meta = theme::meta();
+        let accent = Style::default().fg(theme::ACCENT);
+        doc.note = match variant {
+            Variant::Full => {
+                let host = full
+                    .as_ref()
+                    .and_then(|f| reqwest::Url::parse(&f.url).ok())
+                    .and_then(|u| {
+                        u.host_str()
+                            .map(|h| h.trim_start_matches("www.").to_string())
+                    })
+                    .unwrap_or_default();
+                Some(Line::from(vec![
+                    Span::styled("◆ ", accent),
+                    Span::styled(format!("Full article from {host} · "), meta),
+                    Span::styled("f", theme::key()),
+                    Span::styled(" shows the feed's text", meta),
+                ]))
+            }
+            Variant::Fetching => Some(Line::from(vec![
+                Span::styled("◌ ", accent),
+                Span::styled("Fetching the full article…", meta),
+            ])),
+            Variant::FetchFailed => {
+                let err = match self.full.state(&item.id) {
+                    Some(FullState::Failed(e)) => e.clone(),
+                    _ => String::new(),
+                };
+                // Loud only when asked for with `f`; quiet when automatic.
+                let asked = self.full_view.get(&item.id) == Some(&true);
+                let style = if asked { theme::error() } else { meta };
+                Some(Line::from(vec![
+                    Span::styled("✗ ", theme::error()),
+                    Span::styled(
+                        format!("Feed text: the full article couldn't be fetched ({err}) · "),
+                        style,
+                    ),
+                    Span::styled("f", theme::key()),
+                    Span::styled(" tries again", meta),
+                ]))
+            }
+            Variant::Feed if item.link.is_some() => Some(Line::from(vec![
+                Span::styled("Feed text · ", meta),
+                Span::styled("f", theme::key()),
+                Span::styled(" fetches the full article", meta),
+            ])),
+            Variant::Feed => None,
+        };
+        doc
+    }
+
+    /// The article on screen, rebuilt when its text changes. Starts the
+    /// full-article fetch and image downloads it needs.
+    pub fn current_doc(&mut self) -> Option<&Doc> {
+        let item = self.selected_item()?.clone();
+        if self.wants_full(&item)
+            && let Some(link) = &item.link
+        {
+            self.full.request(&item.id, link, true);
+        }
+        let variant = self.variant(&item);
+        let fresh = self
+            .doc_cache
+            .as_ref()
+            .is_some_and(|(id, v, _)| *id == item.id && *v == variant);
+        if !fresh {
+            let doc = self.build_doc(&item, variant);
+            if let Some(images) = &mut self.images {
+                images.show(&doc.images);
+            }
+            self.doc_cache = Some((item.id.clone(), variant, doc));
+        }
+        self.doc_cache.as_ref().map(|(_, _, d)| d)
+    }
+
+    /// Gets the next articles ready: their full text and their images.
+    fn prefetch(&mut self) {
+        let Some(sel) = self.list.selected() else {
+            return;
+        };
+        let next: Vec<Item> = (sel + 1..sel + 3)
+            .filter_map(|i| self.visible.get(i))
+            .filter_map(|r| self.item(r))
+            .cloned()
+            .collect();
+        for item in next {
+            if self.wants_full(&item) {
+                if let Some(link) = &item.link {
+                    self.full.request(&item.id, link, false);
+                }
+                if matches!(self.full.state(&item.id), Some(FullState::Ready(_))) {
+                    self.prefetch_images(&item, Variant::Full);
+                }
+            } else {
+                self.prefetch_images(&item, Variant::Feed);
+            }
+        }
+    }
+
+    fn prefetch_images(&mut self, item: &Item, variant: Variant) {
+        if self.images.is_none() {
+            return;
+        }
+        let doc = self.build_doc(item, variant);
+        if let Some(images) = &mut self.images {
+            images.prefetch(&doc.images);
+        }
+    }
+
+    fn toggle_full(&mut self) {
+        let Some(item) = self.selected_item().cloned() else {
+            return;
+        };
+        if item.link.is_none() {
+            self.set_status("This article has no link to fetch".into(), true);
+            return;
+        }
+        let failed = matches!(self.full.state(&item.id), Some(FullState::Failed(_)));
+        let show = if failed && self.wants_full(&item) {
+            // Retry rather than switch off.
+            true
+        } else {
+            !self.wants_full(&item)
+        };
+        if show {
+            self.full.retry(&item.id);
+        }
+        self.full_view.insert(item.id.clone(), show);
+        self.scroll = 0;
+        self.mark_selected_read();
+    }
+
+    /// Notes movement; a burst of it (a held key) counts as fast scrolling.
+    fn motion(&mut self) {
+        let now = Instant::now();
+        if self
+            .motion_at
+            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(150))
+        {
+            self.fast_until = Some(now + Duration::from_millis(220));
+        }
+        self.motion_at = Some(now);
+    }
+
+    /// Whether the reader is scrolling fast enough that heavy images should
+    /// wait for a pause.
+    pub fn fast_scrolling(&self) -> bool {
+        self.fast_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// True once when fast scrolling has just ended (time to draw again).
+    pub fn settle_due(&mut self) -> bool {
+        if self.fast_until.is_some_and(|t| Instant::now() >= t) {
+            self.fast_until = None;
+            return true;
+        }
+        false
     }
 
     fn article_page(&self) -> usize {
@@ -411,6 +617,7 @@ impl App {
     }
 
     fn scroll_by(&mut self, delta: isize) {
+        self.motion();
         let max = self.article_rows.saturating_sub(self.article_page());
         self.scroll = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
     }
@@ -446,8 +653,9 @@ impl App {
                             self.store.feed_titles.insert(url.clone(), t);
                         }
                         self.store.merge(&url, fetched.items);
-                        self.article_cache = None;
+                        self.doc_cache = None;
                         self.rebuild_list(None);
+                        self.prefetch();
                         self.dirty = true;
                     }
                     Err(e) => {
@@ -465,9 +673,26 @@ impl App {
                     images.on_decoded(url, img);
                 }
             }
-            Event::ImageEncoded(url, size, proto) => {
+            Event::ImageEncoded(url, size, standin, proto) => {
                 if let Some(images) = &mut self.images {
-                    images.on_encoded(url, size, proto);
+                    images.on_encoded(url, size, standin, proto);
+                }
+            }
+            Event::FullFetched(id, result) => {
+                let ok = result.is_ok();
+                self.full.on_done(id.clone(), result);
+                // A prefetched article: fetch its images too.
+                let current = self.selected_item().is_some_and(|i| i.id == id);
+                if ok
+                    && !current
+                    && let Some(item) = self
+                        .visible
+                        .iter()
+                        .filter_map(|r| self.item(r))
+                        .find(|i| i.id == id)
+                        .cloned()
+                {
+                    self.prefetch_images(&item, Variant::Full);
                 }
             }
         }
@@ -683,6 +908,7 @@ impl App {
                 self.set_status("Refreshing all feeds".into(), false);
             }
             (KeyCode::Char('m'), false) => self.toggle_read(),
+            (KeyCode::Char('f'), false) => self.toggle_full(),
             (KeyCode::Char('x'), false) => {
                 self.unread_only = !self.unread_only;
                 self.rebuild_list(None);

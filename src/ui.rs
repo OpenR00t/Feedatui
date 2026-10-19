@@ -5,25 +5,32 @@
 
 use chrono::Utc;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect, Size};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
+use ratatui_image::FontSize;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 
-use crate::app::{App, Focus, PickerRow, Popup};
-use crate::article::{Block as ABlock, truncate, wrap};
-use crate::images::{ImgState, fit_size};
+use crate::app::{App, Focus, PickerRow, Popup, Scope};
+use crate::article::{Bounds, Placed, Slot, layout, truncate};
+use crate::images::{ImgState, fit_dims, fit_size};
 use crate::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::default().style(theme::page()), area);
 
-    let [main, bar] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let [tabs, main, bar] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    draw_tabs(f, app, tabs);
     let list_w = (u32::from(main.width) * 32 / 100).clamp(28, 60) as u16;
     let [left, right] = Layout::horizontal([
         Constraint::Length(list_w.min(main.width / 2)),
@@ -178,7 +185,7 @@ fn draw_article(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let Some(article) = app.article(content.width).cloned() else {
+    let Some(doc) = app.current_doc().cloned() else {
         f.render_widget(block, area);
         let msg = if app.visible.is_empty() {
             ""
@@ -196,73 +203,32 @@ fn draw_article(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    // Lay out: each block's height in rows.
-    let max_img_h = content.height.saturating_sub(2).max(4);
-    enum Placed {
-        Text(Line<'static>),
-        Image {
-            url: String,
-            size: Size,
-            caption: Vec<String>,
-        },
-        Note(Line<'static>),
-    }
-    let mut placed: Vec<(usize, usize, Placed)> = Vec::new(); // (top, height, what)
-    let mut y = 0usize;
-    for b in article.blocks {
-        match b {
-            ABlock::Text(line) => {
-                placed.push((y, 1, Placed::Text(line)));
-                y += 1;
-            }
-            ABlock::Image { url, alt } => {
-                let state = app.images.as_ref().and_then(|i| i.state(&url));
-                match state {
-                    Some(ImgState::Ready(img)) => {
-                        let font = app
-                            .images
-                            .as_ref()
-                            .map_or(ratatui_image::FontSize::new(10, 20), |i| i.font_size());
-                        let size = fit_size(img, font, content.width, max_img_h);
-                        let caption = wrap(&alt, usize::from(content.width));
-                        let h = usize::from(size.height) + caption.len();
-                        placed.push((y, h, Placed::Image { url, size, caption }));
-                        y += h;
-                    }
-                    Some(ImgState::Loading) => {
-                        placed.push((
-                            y,
-                            1,
-                            Placed::Note(Line::styled("◌ loading image…", theme::meta())),
-                        ));
-                        y += 1;
-                    }
-                    Some(ImgState::Failed) | None => {
-                        let text = if app.images.is_none() {
-                            if alt.is_empty() {
-                                "[image]".to_string()
-                            } else {
-                                format!("[image: {alt}]")
-                            }
-                        } else if alt.is_empty() {
-                            continue;
-                        } else {
-                            format!("[image: {alt}]")
-                        };
-                        placed.push((y, 1, Placed::Note(Line::styled(text, theme::meta()))));
-                        y += 1;
-                    }
-                }
-            }
+    let bounds = Bounds {
+        width: content.width,
+        height: content.height,
+        lead_pct: app.cfg.lead_image_width,
+        max_h_pct: app.cfg.image_max_height,
+    };
+    let font = app
+        .images
+        .as_ref()
+        .map_or(FontSize::new(10, 20), |i| i.font_size());
+    let images = app.images.as_ref();
+    let mut slot = |url: &str, max_w: u16, max_h: u16| -> Slot {
+        match images.and_then(|i| i.state(url)) {
+            Some(ImgState::Ready(img)) => Slot::Ready(fit_size(img, font, max_w, max_h)),
+            // Hold a 16:9 box while it loads.
+            Some(ImgState::Loading) => Slot::Loading(fit_dims(1600, 900, font, max_w, max_h)),
+            _ => Slot::Missing,
         }
-    }
+    };
+    let lay = layout(&doc, &bounds, &mut slot);
+
+    let y = lay.height;
     app.article_rows = y;
     let page = usize::from(content.height);
     app.scroll = app.scroll.min(y.saturating_sub(page));
     let scroll = app.scroll;
-    // Terminal graphics (sixel especially) can paint over popups, so images
-    // step aside while one is open.
-    let hide_images = !matches!(app.popup, Popup::None);
 
     let pct = if y <= page {
         String::new()
@@ -272,66 +238,67 @@ fn draw_article(f: &mut Frame, app: &mut App, area: Rect) {
     let block = block.title_bottom(Line::styled(pct, theme::meta()).alignment(Alignment::Right));
     f.render_widget(block, area);
 
-    for (top, h, what) in placed {
-        if top + h <= scroll || top >= scroll + page {
+    // Heavy protocols (sixel) wait while a popup is open (they'd paint over
+    // it) and use half-block stand-ins while scrolling fast.
+    let hide_images = !matches!(app.popup, Popup::None);
+    let standin = app.fast_scrolling() && app.images.as_ref().is_some_and(|i| i.heavy());
+
+    for piece in lay.pieces {
+        let h = match &piece.what {
+            Placed::Text(_) => 1,
+            Placed::Image { size, .. } => usize::from(size.height),
+        };
+        if piece.y + h <= scroll || piece.y >= scroll + page {
             continue;
         }
-        let rel = top as isize - scroll as isize;
-        match what {
-            Placed::Text(line) | Placed::Note(line) => {
+        let rel = piece.y as isize - scroll as isize;
+        let x = content.x + piece.x.min(content.width);
+        match piece.what {
+            Placed::Text(line) => {
                 let r = Rect {
+                    x,
                     y: content.y + rel as u16,
+                    width: content.right().saturating_sub(x),
                     height: 1,
-                    ..content
                 };
                 f.render_widget(Paragraph::new(line), r);
             }
-            Placed::Image { url, size, caption } => {
-                let x_off = (content.width - size.width) / 2;
-                let proto = if hide_images {
+            Placed::Image { url, size, loading } => {
+                let proto = if hide_images || loading {
                     None
                 } else {
-                    app.images.as_mut().and_then(|i| i.protocol(&url, size))
+                    app.images
+                        .as_mut()
+                        .and_then(|i| i.protocol(&url, size, standin))
                 };
                 match proto {
                     Some(p) => {
-                        let pos = SignedPosition::from((x_off as i16, rel as i16));
+                        let pos = SignedPosition::from((piece.x as i16, rel as i16));
                         f.render_widget(SlicedImage::new(p, pos), content);
                     }
                     None => {
-                        // Encoding (or hidden): hold the space so the layout doesn't jump.
+                        // Loading or encoding: hold the space so text doesn't jump.
                         let first = rel.max(0) as u16;
                         let last = (rel + size.height as isize).min(page as isize) as u16;
                         if last > first {
-                            let r = Rect::new(
-                                content.x + x_off,
-                                content.y + first,
-                                size.width,
-                                last - first,
-                            );
+                            let r = Rect::new(x, content.y + first, size.width, last - first);
                             f.render_widget(
                                 Block::default().style(Style::default().bg(theme::BG0_H)),
                                 r,
                             );
+                            if loading && rel >= 0 && size.height > 2 && size.width > 12 {
+                                let mid = Rect {
+                                    y: content.y + first + (last - first) / 2,
+                                    height: 1,
+                                    ..r
+                                };
+                                f.render_widget(
+                                    Paragraph::new(Line::styled("loading image…", theme::meta()))
+                                        .alignment(Alignment::Center),
+                                    mid,
+                                );
+                            }
                         }
-                    }
-                }
-                for (n, c) in caption.into_iter().enumerate() {
-                    let cy = rel + size.height as isize + n as isize;
-                    if cy >= 0 && (cy as usize) < page {
-                        let r = Rect {
-                            y: content.y + cy as u16,
-                            height: 1,
-                            ..content
-                        };
-                        f.render_widget(
-                            Paragraph::new(Line::styled(
-                                c,
-                                theme::meta().add_modifier(Modifier::ITALIC),
-                            ))
-                            .alignment(Alignment::Center),
-                            r,
-                        );
                     }
                 }
             }
@@ -354,6 +321,48 @@ fn draw_article(f: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
     }
+}
+
+/// One row of group tabs with unread counts; the current one highlighted.
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::BG0_H)),
+        area,
+    );
+    let current = match app.scope {
+        Scope::All => 0,
+        Scope::Group(g) | Scope::Feed(g, _) => g + 1,
+    };
+    let mut tabs: Vec<(String, usize)> = vec![("All".into(), app.unread_for(PickerRow::All))];
+    for (g, group) in app.cfg.groups.iter().enumerate() {
+        tabs.push((group.name.clone(), app.unread_for(PickerRow::Group(g))));
+    }
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (name, unread)) in tabs.into_iter().enumerate() {
+        let active = i == current;
+        let bg = if active { theme::BG1 } else { theme::BG0_H };
+        let name_style = if active {
+            Style::default()
+                .fg(theme::ACCENT)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::FG4).bg(bg)
+        };
+        spans.push(Span::styled(" ", Style::default().bg(bg)));
+        spans.push(Span::styled(name, name_style));
+        if unread > 0 {
+            spans.push(Span::styled(
+                format!(" {unread}"),
+                Style::default()
+                    .fg(if active { theme::FG0 } else { theme::ACCENT_2 })
+                    .bg(bg),
+            ));
+        }
+        spans.push(Span::styled(" ", Style::default().bg(bg)));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn hint<'a>(key: &'a str, what: &'a str) -> [Span<'a>; 2] {
@@ -389,6 +398,7 @@ fn draw_bar(f: &mut Frame, app: &mut App, area: Rect) {
         ("j/k", "move"),
         ("h/l", "pane"),
         ("o", "open"),
+        ("f", "full"),
         ("b", "groups"),
         ("r", "refresh"),
         ("?", "help"),
@@ -565,6 +575,7 @@ fn draw_help(f: &mut Frame) {
         ("b", "feed group picker (l/h show a group's feeds)"),
         ("gt / gT", "next / previous group"),
         ("r / R", "refresh this group / everything"),
+        ("f", "full article / feed text"),
         ("m", "toggle read"),
         ("x", "show unread only"),
         ("/", "filter by title or feed name (Esc clears)"),
