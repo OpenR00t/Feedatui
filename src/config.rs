@@ -47,6 +47,9 @@ image_max_height = 40
 # at startup when the cache grows past this.
 cache_limit_mb = 200
 
+# Show the current group and its unread count in the terminal's tab title.
+terminal_title = true
+
 # Program used to open links. Leave unset for the system default browser.
 # browser = "firefox"
 
@@ -141,6 +144,8 @@ pub struct Config {
     pub full_article: FullMode,
     #[serde(default = "default_true")]
     pub smooth_scroll: bool,
+    #[serde(default = "default_true")]
+    pub terminal_title: bool,
     #[serde(default)]
     pub browser: Option<String>,
     #[serde(default, rename = "group")]

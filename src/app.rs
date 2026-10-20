@@ -292,6 +292,16 @@ impl App {
         }
     }
 
+    /// The terminal tab title: app, current group or feed, unread count.
+    pub fn window_title(&self) -> String {
+        let unread = self.unread_in(&self.scope_urls(self.scope));
+        if unread > 0 {
+            format!("Feedatui · {} · {unread} unread", self.scope_name())
+        } else {
+            format!("Feedatui · {}", self.scope_name())
+        }
+    }
+
     pub fn unread_in(&self, urls: &[String]) -> usize {
         urls.iter()
             .filter_map(|u| self.store.items.get(u))

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate, SetTitle};
 use ratatui_image::picker::Picker;
 
 use crate::app::{App, Scope};
@@ -37,6 +37,14 @@ const USAGE: &str = "usage: feedatui [command]
   export [file.opml]   write every group and feed as OPML (to stdout without a file)
   paths                show where the config, state and caches live
   --version            print the version";
+
+/// Writes an escape sequence straight to the terminal.
+fn raw(bytes: &[u8]) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -113,6 +121,11 @@ fn run() -> Result<()> {
         });
     }
 
+    let set_title = cfg.terminal_title;
+    if set_title {
+        // Save the current title (xterm-style; ignored where unsupported).
+        raw(b"\x1b[22;0t");
+    }
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         // The graphics probe talks to the terminal, so it runs after init.
@@ -129,6 +142,7 @@ fn run() -> Result<()> {
         app.refresh(Scope::All);
 
         let mut dirty = true;
+        let mut title = String::new();
         let mut last_draw = Instant::now();
         while !app.quit {
             // Redraw on change, and once a second for clocks and messages.
@@ -141,6 +155,13 @@ fn run() -> Result<()> {
                 drawn?;
                 dirty = false;
                 last_draw = Instant::now();
+                if set_title {
+                    let t = app.window_title();
+                    if t != title {
+                        execute!(std::io::stdout(), SetTitle(&t))?;
+                        title = t;
+                    }
+                }
             }
             let animating = app.animate();
             dirty |= animating;
@@ -172,6 +193,12 @@ fn run() -> Result<()> {
         Ok(())
     })();
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    if set_title {
+        // Clear ours (terminals then show their default), then restore the
+        // saved title where the terminal supports it.
+        let _ = execute!(std::io::stdout(), SetTitle(""));
+        raw(b"\x1b[23;0t");
+    }
     ratatui::restore();
     result
 }

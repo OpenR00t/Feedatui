@@ -47,6 +47,7 @@ images = true           # false: no graphics probe, no image downloads
 lead_image_width = 40   # % of the pane for the top-left picture (0: above the text)
 image_max_height = 40   # tallest image, % of the pane height
 smooth_scroll = true    # glide over page jumps instead of snapping
+terminal_title = true   # tab title: "Feedatui · Tech · 12 unread"
 cache_limit_mb = 200    # image cache size
 # browser = "firefox"   # program for links; default is the system browser
 
