@@ -10,6 +10,7 @@ mod feed;
 mod fulltext;
 mod html;
 mod images;
+mod nextjs;
 mod opml;
 mod store;
 mod theme;

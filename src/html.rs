@@ -94,6 +94,29 @@ pub fn pick_from_srcset(set: &str) -> Option<String> {
         .map(|c| c.1.clone())
 }
 
+/// Image CDNs that take the size in the URL (Cloudinary-style
+/// `/image/upload/…,w_3392,…/`): ask for a ~1000 px copy instead of a huge one.
+pub fn shrink_cdn(url: &str) -> String {
+    let Some(at) = url.find("/image/upload/") else {
+        return url.to_string();
+    };
+    let (head, tail) = url.split_at(at + "/image/upload/".len());
+    let mut parts: Vec<String> = tail.split('/').map(str::to_string).collect();
+    for part in parts.iter_mut().take(4) {
+        let opts: Vec<String> = part
+            .split(',')
+            .map(
+                |o| match o.strip_prefix("w_").and_then(|w| w.parse::<u32>().ok()) {
+                    Some(w) if w > WANTED_WIDTH + 400 => format!("w_{WANTED_WIDTH}"),
+                    _ => o.to_string(),
+                },
+            )
+            .collect();
+        *part = opts.join(",");
+    }
+    format!("{head}{}", parts.join("/"))
+}
+
 /// Splits a srcset on the commas between candidates (URLs may contain commas,
 /// e.g. image CDNs, so a comma only splits when followed by whitespace).
 fn split_srcset(set: &str) -> Vec<&str> {
@@ -190,6 +213,20 @@ mod tests {
         assert_eq!(
             pick_from_srcset(cdn).as_deref(),
             Some("https://i.example/w_1200,q_80/p.jpg")
+        );
+    }
+
+    #[test]
+    fn cdn_widths_shrink() {
+        assert_eq!(
+            shrink_cdn("https://media.example.com/image/upload/c_lfill,w_3392/q_auto/v1/a/b.webp"),
+            "https://media.example.com/image/upload/c_lfill,w_1000/q_auto/v1/a/b.webp"
+        );
+        let small = "https://media.example.com/image/upload/w_600/x.jpg";
+        assert_eq!(shrink_cdn(small), small);
+        assert_eq!(
+            shrink_cdn("https://x.example/w_3000.jpg"),
+            "https://x.example/w_3000.jpg"
         );
     }
 

@@ -18,6 +18,8 @@ use crate::app::Event;
 const WORKERS: usize = 3;
 /// Extracted articles shorter than this are treated as a failed extraction.
 const MIN_TEXT: usize = 200;
+/// Below this much text, other places in the page are tried too.
+const GOOD_ENOUGH: usize = 1500;
 /// Cached articles older than this are fetched again.
 const MAX_AGE: Duration = Duration::from_secs(14 * 24 * 3600);
 
@@ -196,17 +198,39 @@ fn load(client: &reqwest::blocking::Client, dir: &Path, id: &str, url: &str) -> 
     })
 }
 
-/// Pulls the article out of a web page.
+/// Pulls the article out of a web page. If Readability finds little, the
+/// page may carry its article elsewhere: in a Next.js data payload (rebuilt
+/// into HTML) or as JSON-LD `articleBody`. The longest result wins.
 pub fn extract(page: &str, url: &str) -> Result<String> {
-    let mut r = dom_smoothie::Readability::new(page, Some(url), None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let article = r
-        .parse()
-        .map_err(|_| anyhow::anyhow!("no article found on the page"))?;
-    if article.text_content.trim().chars().count() < MIN_TEXT {
-        bail!("no article found on the page");
+    let mut best = readable(page, url);
+    if best.as_ref().is_none_or(|(len, _)| *len < GOOD_ENOUGH) {
+        let doc = dom_query::Document::from(page);
+        let mut candidates = Vec::new();
+        if let Some(rebuilt) = crate::nextjs::rebuild(&doc) {
+            candidates.extend(readable(&rebuilt, url));
+        }
+        if let Some(body) = crate::nextjs::json_ld_body(&doc) {
+            let len = crate::html::word_count(&body) * 6;
+            candidates.push((len, body));
+        }
+        for c in candidates {
+            if best.as_ref().is_none_or(|b| c.0 > b.0) {
+                best = Some(c);
+            }
+        }
     }
-    Ok(article.content.to_string())
+    match best {
+        Some((len, html)) if len >= MIN_TEXT => Ok(html),
+        _ => bail!("no article found on the page"),
+    }
+}
+
+/// Readability's article and its text length.
+fn readable(page: &str, url: &str) -> Option<(usize, String)> {
+    let mut r = dom_smoothie::Readability::new(page, Some(url), None).ok()?;
+    let article = r.parse().ok()?;
+    let len = article.text_content.trim().chars().count();
+    Some((len, article.content.to_string()))
 }
 
 /// Removes cached articles older than [`MAX_AGE`].

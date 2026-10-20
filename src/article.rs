@@ -171,7 +171,7 @@ pub fn build(item: &Item, source: &str, body: &str, base: Option<&str>) -> Doc {
             let shown = blocks
                 .iter()
                 .any(|b| matches!(b, Block::Image { url, .. } if same_image(url, img)));
-            (!shown).then(|| (img.clone(), String::new()))
+            (!shown).then(|| (crate::html::shrink_cdn(img), String::new()))
         }),
     };
     while matches!(blocks.first(), Some(Block::Blank)) {
@@ -275,10 +275,11 @@ fn resolve(src: &str, base: Option<&reqwest::Url>) -> Option<String> {
     if src.starts_with("data:") || src.is_empty() {
         return None;
     }
-    match reqwest::Url::parse(src) {
-        Ok(u) => Some(u.to_string()),
-        Err(_) => base.and_then(|b| b.join(src).ok()).map(|u| u.to_string()),
-    }
+    let url = match reqwest::Url::parse(src) {
+        Ok(u) => u.to_string(),
+        Err(_) => base.and_then(|b| b.join(src).ok())?.to_string(),
+    };
+    Some(crate::html::shrink_cdn(&url))
 }
 
 /// Splits the leading `> `, indent and bullet off a line's text.
