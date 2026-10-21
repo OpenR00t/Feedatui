@@ -3,7 +3,7 @@ name = "feedatui"
 version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/OpenR00t/Ballatui"
+repository = "https://github.com/OpenR00t/Feedatui"
 description = "A terminal RSS/Atom feed reader with inline images"
 
 [dependencies]
