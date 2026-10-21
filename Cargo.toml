@@ -3,6 +3,7 @@ name = "feedatui"
 version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/OpenR00t/Ballatui"
 description = "A terminal RSS/Atom feed reader with inline images"
 
 [dependencies]
@@ -36,3 +37,8 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 [profile.release]
 lto = "thin"
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
